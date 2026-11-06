@@ -1,7 +1,16 @@
 require("dotenv").config();
 
 const express = require("express");
-const cors = require("cors");
+const cors = require('cors');
+
+app.use(cors({
+  origin: [
+    'https://coffee-management-system-pearl.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:5000'
+  ],
+  credentials: true
+}));
 const jwt = require("jsonwebtoken");
 const { createClient } = require("redis");
 const crypto = require("crypto");
@@ -349,5 +358,6 @@ async function start() {
     process.exit(1);
   }
 }
+
 
 start();
