@@ -3,7 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
-const mysql = require("mysql2/promise");
+const { createClient } = require("redis");
 const crypto = require("crypto");
 
 const app = express();
@@ -12,10 +12,6 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const STAFF_USERNAME = process.env.STAFF_USERNAME;
 const STAFF_PASSWORD = process.env.STAFF_PASSWORD;
 
-if (!process.env.MYSQL_HOST || !process.env.MYSQL_USER || !process.env.MYSQL_DATABASE) {
-  console.error("Set MYSQL_HOST, MYSQL_USER and MYSQL_DATABASE in backend/.env.");
-  process.exit(1);
-}
 if (!JWT_SECRET || !STAFF_USERNAME || !STAFF_PASSWORD) {
   console.error("Set JWT_SECRET, STAFF_USERNAME and STAFF_PASSWORD in backend/.env.");
   process.exit(1);
@@ -28,19 +24,12 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "100kb" }));
 
-const db = mysql.createPool({
-  host: process.env.MYSQL_HOST,
-  port: Number(process.env.MYSQL_PORT || 3306),
-  user: process.env.MYSQL_USER,
-  password: process.env.MYSQL_PASSWORD || "",
-  database: process.env.MYSQL_DATABASE,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  timezone: "Z",
-  decimalNumbers: true,
-  ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: true } : undefined
+// Initialize Redis Client
+const redisClient = createClient({
+  url: process.env.REDIS_URL || "redis://localhost:6379"
 });
+
+redisClient.on("error", (err) => console.error("Redis Client Error", err));
 
 function httpError(status, message) {
   const error = new Error(message);
@@ -70,104 +59,43 @@ function readQuantity(value) {
 function publicOrderId(number) {
   return `V${String(number).padStart(4, "0")}`;
 }
-function orderNumberFromId(id) {
-  if (typeof id !== "string" || !/^V\d+$/.test(id)) return null;
-  const number = Number(id.slice(1));
-  return Number.isSafeInteger(number) && number > 0 ? number : null;
-}
-function mapMenu(row) {
-  return {
-    id: row.id,
-    name: row.name,
-    description: row.description,
-    category: row.category,
-    price: Number(row.price),
-    available: Boolean(row.available),
-    createdAt: new Date(row.created_at).toISOString(),
-    ...(row.updated_at ? { updatedAt: new Date(row.updated_at).toISOString() } : {})
-  };
-}
-function mapOrder(row, items) {
-  return {
-    id: publicOrderId(row.order_number),
-    customerName: row.customer_name,
-    items,
-    total: Number(row.total),
-    currency: row.currency,
-    status: row.status,
-    createdAt: new Date(row.created_at).toISOString(),
-    updatedAt: new Date(row.updated_at).toISOString()
-  };
-}
-async function getMenuItem(id) {
-  const [rows] = await db.execute("SELECT * FROM menu_items WHERE id = ? LIMIT 1", [id]);
-  return rows.length ? mapMenu(rows[0]) : null;
-}
-async function getAllMenu() {
-  const [rows] = await db.execute("SELECT * FROM menu_items ORDER BY name ASC");
-  return rows.map(mapMenu);
-}
-async function getOrder(id) {
-  const number = orderNumberFromId(id);
-  if (!number) return null;
-  const [rows] = await db.execute("SELECT * FROM orders WHERE order_number = ? LIMIT 1", [number]);
-  if (!rows.length) return null;
-  const [itemRows] = await db.execute(
-    "SELECT menu_item_id, item_name, unit_price, quantity, subtotal FROM order_items WHERE order_number = ? ORDER BY id ASC",
-    [number]
-  );
-  const items = itemRows.map((item) => ({
-    id: item.menu_item_id,
-    name: item.item_name,
-    unitPrice: Number(item.unit_price),
-    quantity: Number(item.quantity),
-    subtotal: Number(item.subtotal)
-  }));
-  return mapOrder(rows[0], items);
-}
-async function getAllOrders() {
-  const [rows] = await db.execute("SELECT * FROM orders ORDER BY created_at DESC, order_number DESC");
-  const orders = await Promise.all(rows.map((row) => getOrder(publicOrderId(row.order_number))));
-  return orders.filter(Boolean);
-}
-async function initialiseDatabase() {
-  await db.execute(`CREATE TABLE IF NOT EXISTS menu_items (
-    id VARCHAR(36) PRIMARY KEY,
-    name VARCHAR(80) NOT NULL,
-    description VARCHAR(250) NOT NULL,
-    category VARCHAR(40) NOT NULL,
-    price DECIMAL(10,2) NOT NULL,
-    available BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_menu_category (category),
-    INDEX idx_menu_available (available)
-  ) ENGINE=InnoDB`);
-  await db.execute(`CREATE TABLE IF NOT EXISTS orders (
-    order_number BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    customer_name VARCHAR(80) NOT NULL,
-    total DECIMAL(10,2) NOT NULL,
-    currency CHAR(3) NOT NULL DEFAULT 'LSL',
-    status ENUM('Pending','Preparing','Ready','Collected') NOT NULL DEFAULT 'Pending',
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_orders_created_at (created_at),
-    INDEX idx_orders_status (status)
-  ) ENGINE=InnoDB`);
-  await db.execute(`CREATE TABLE IF NOT EXISTS order_items (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    order_number BIGINT UNSIGNED NOT NULL,
-    menu_item_id VARCHAR(36) NOT NULL,
-    item_name VARCHAR(80) NOT NULL,
-    unit_price DECIMAL(10,2) NOT NULL,
-    quantity INT UNSIGNED NOT NULL,
-    subtotal DECIMAL(10,2) NOT NULL,
-    CONSTRAINT fk_order_items_order FOREIGN KEY (order_number) REFERENCES orders(order_number) ON DELETE CASCADE,
-    INDEX idx_order_items_order (order_number)
-  ) ENGINE=InnoDB`);
 
-  const [countRows] = await db.execute("SELECT COUNT(*) AS count FROM menu_items");
-  if (Number(countRows[0].count) > 0) return;
+// --- REDIS DATA HELPERS ---
+async function getMenuItem(id) {
+  const data = await redisClient.get(`menu:${id}`);
+  return data ? JSON.parse(data) : null;
+}
+
+async function getAllMenu() {
+  const ids = await redisClient.sMembers("menu:ids");
+  const items = [];
+  for (const id of ids) {
+    const item = await getMenuItem(id);
+    if (item) items.push(item);
+  }
+  return items.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function getOrder(id) {
+  const data = await redisClient.get(`order:${id}`);
+  return data ? JSON.parse(data) : null;
+}
+
+async function getAllOrders() {
+  const ids = await redisClient.sMembers("order:ids");
+  const orders = [];
+  for (const id of ids) {
+    const order = await getOrder(id);
+    if (order) orders.push(order);
+  }
+  // Sort descending by creation date
+  return orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+async function initialiseDatabase() {
+  const ids = await redisClient.sMembers("menu:ids");
+  if (ids.length > 0) return;
+
   const seedItems = [
     { name: "Espresso", description: "Bold and rich", category: "Coffee", price: 30 },
     { name: "Americano", description: "Smooth and balanced", category: "Coffee", price: 35 },
@@ -190,14 +118,24 @@ async function initialiseDatabase() {
     { name: "Whipped Cream", description: "Creamy topping", category: "Extras", price: 5 },
     { name: "Flavoured Syrup", description: "Vanilla, caramel or hazelnut", category: "Extras", price: 5 }
   ];
+
   for (const item of seedItems) {
-    await db.execute(
-      "INSERT INTO menu_items (id, name, description, category, price, available) VALUES (?, ?, ?, ?, ?, TRUE)",
-      [crypto.randomUUID(), item.name, item.description, item.category, item.price]
-    );
+    const id = crypto.randomUUID();
+    const newItem = {
+      id,
+      name: item.name,
+      description: item.description,
+      category: item.category,
+      price: item.price,
+      available: true,
+      createdAt: new Date().toISOString()
+    };
+    await redisClient.set(`menu:${id}`, JSON.stringify(newItem));
+    await redisClient.sAdd("menu:ids", id);
   }
-  console.log("Seeded initial Aroma Coffee menu in MySQL.");
+  console.log("Seeded initial Aroma Coffee menu in Redis.");
 }
+
 function requireStaff(req, res, next) {
   const header = req.headers.authorization || "";
   const [scheme, token] = header.split(" ");
@@ -214,13 +152,15 @@ function requireStaff(req, res, next) {
 
 app.get("/api/health", async (req, res, next) => {
   try {
-    await db.query("SELECT 1");
-    res.json({ status: "OK", database: "connected", databaseType: "MySQL", service: "Aroma Coffee API" });
+    await redisClient.ping();
+    res.json({ status: "OK", database: "connected", databaseType: "Redis (Key-Value NoSQL)", service: "Aroma Coffee API" });
   } catch (error) { next(error); }
 });
+
 app.get("/api/menu", async (req, res, next) => {
   try { res.json(await getAllMenu()); } catch (error) { next(error); }
 });
+
 app.get("/api/menu/:id", async (req, res, next) => {
   try {
     const item = await getMenuItem(req.params.id);
@@ -228,16 +168,19 @@ app.get("/api/menu/:id", async (req, res, next) => {
     res.json(item);
   } catch (error) { next(error); }
 });
+
 app.post("/api/staff/login", (req, res) => {
   const { username, password } = req.body || {};
   if (username !== STAFF_USERNAME || password !== STAFF_PASSWORD) return res.status(401).json({ error: "Incorrect username or password." });
   const token = jwt.sign({ username, role: "staff" }, JWT_SECRET, { expiresIn: "8h" });
   res.json({ token, username, expiresIn: "8h" });
 });
+
 app.post("/api/menu", requireStaff, async (req, res, next) => {
   try {
+    const id = crypto.randomUUID();
     const item = {
-      id: crypto.randomUUID(),
+      id,
       name: readText(req.body.name, "Name", 80),
       description: readText(req.body.description, "Description", 250),
       category: readText(req.body.category, "Category", 40),
@@ -245,11 +188,12 @@ app.post("/api/menu", requireStaff, async (req, res, next) => {
       available: readBoolean(req.body.available),
       createdAt: new Date().toISOString()
     };
-    await db.execute("INSERT INTO menu_items (id, name, description, category, price, available) VALUES (?, ?, ?, ?, ?, ?)",
-      [item.id, item.name, item.description, item.category, item.price, item.available]);
+    await redisClient.set(`menu:${id}`, JSON.stringify(item));
+    await redisClient.sAdd("menu:ids", id);
     res.status(201).json(item);
   } catch (error) { next(error); }
 });
+
 app.put("/api/menu/:id", requireStaff, async (req, res, next) => {
   try {
     const existing = await getMenuItem(req.params.id);
@@ -263,30 +207,33 @@ app.put("/api/menu/:id", requireStaff, async (req, res, next) => {
       available: readBoolean(req.body.available),
       updatedAt: new Date().toISOString()
     };
-    await db.execute("UPDATE menu_items SET name = ?, description = ?, category = ?, price = ?, available = ? WHERE id = ?",
-      [item.name, item.description, item.category, item.price, item.available, item.id]);
+    await redisClient.set(`menu:${req.params.id}`, JSON.stringify(item));
     res.json(item);
   } catch (error) { next(error); }
 });
+
 app.delete("/api/menu/:id", requireStaff, async (req, res, next) => {
   try {
-    const [result] = await db.execute("DELETE FROM menu_items WHERE id = ?", [req.params.id]);
-    if (!result.affectedRows) throw httpError(404, "Menu item not found.");
+    const deleted = await redisClient.del(`menu:${req.params.id}`);
+    if (!deleted) throw httpError(404, "Menu item not found.");
+    await redisClient.sRem("menu:ids", req.params.id);
     res.json({ message: "Menu item deleted." });
   } catch (error) { next(error); }
 });
+
 app.post("/api/orders", async (req, res, next) => {
-  let connection;
   try {
     const customerName = readText(req.body.customerName, "Customer name", 80);
     if (!Array.isArray(req.body.items) || req.body.items.length === 0) throw httpError(400, "Add at least one item to your order.");
     if (req.body.items.length > 50) throw httpError(400, "Too many different items in one order.");
+    
     const requested = new Map();
     for (const entry of req.body.items) {
       const id = readText(entry.id, "Menu item ID", 100);
       const quantity = readQuantity(entry.quantity);
       requested.set(id, (requested.get(id) || 0) + quantity);
     }
+
     const items = [];
     let total = 0;
     for (const [id, quantity] of requested.entries()) {
@@ -294,85 +241,113 @@ app.post("/api/orders", async (req, res, next) => {
       if (!menuItem) throw httpError(400, "One of the selected menu items no longer exists.");
       if (!menuItem.available) throw httpError(400, `${menuItem.name} is currently unavailable.`);
       if (quantity > 99) throw httpError(400, "Maximum quantity per item is 99.");
+      
       const subtotal = Math.round(menuItem.price * quantity * 100) / 100;
       total += subtotal;
       items.push({ id: menuItem.id, name: menuItem.name, unitPrice: menuItem.price, quantity, subtotal });
     }
     total = Math.round(total * 100) / 100;
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-    const [orderResult] = await connection.execute(
-      "INSERT INTO orders (customer_name, total, currency, status) VALUES (?, ?, 'LSL', 'Pending')", [customerName, total]);
-    const orderNumber = orderResult.insertId;
-    for (const item of items) {
-      await connection.execute(
-        "INSERT INTO order_items (order_number, menu_item_id, item_name, unit_price, quantity, subtotal) VALUES (?, ?, ?, ?, ?, ?)",
-        [orderNumber, item.id, item.name, item.unitPrice, item.quantity, item.subtotal]);
-    }
-    await connection.commit();
-    const order = await getOrder(publicOrderId(orderNumber));
+
+    // Generate auto-incrementing sequential order number using Redis INCR counter
+    const orderNumber = await redisClient.incr("order:counter");
+    const orderId = publicOrderId(orderNumber);
+    const timestamp = new Date().toISOString();
+
+    const order = {
+      id: orderId,
+      customerName,
+      items,
+      total,
+      currency: "LSL",
+      status: "Pending",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+
+    await redisClient.set(`order:${orderId}`, JSON.stringify(order));
+    await redisClient.sAdd("order:ids", orderId);
+
     res.status(201).json(order);
-  } catch (error) {
-    if (connection) await connection.rollback().catch(() => {});
-    next(error);
-  } finally {
-    if (connection) connection.release();
-  }
+  } catch (error) { next(error); }
 });
+
 app.get("/api/orders/:id", async (req, res, next) => {
   try {
     const order = await getOrder(req.params.id);
     if (!order) throw httpError(404, "Order not found.");
-    res.json({ id: order.id, customerName: order.customerName, items: order.items, total: order.total, currency: order.currency, status: order.status, createdAt: order.createdAt });
+    res.json(order);
   } catch (error) { next(error); }
 });
+
 app.get("/api/orders", requireStaff, async (req, res, next) => {
   try { res.json(await getAllOrders()); } catch (error) { next(error); }
 });
+
 app.patch("/api/orders/:id/status", requireStaff, async (req, res, next) => {
   try {
     const order = await getOrder(req.params.id);
     if (!order) throw httpError(404, "Order not found.");
+    
     const allowedStatuses = ["Pending", "Preparing", "Ready", "Collected"];
     const nextStatus = req.body.status;
     if (!allowedStatuses.includes(nextStatus)) throw httpError(400, "Status must be Pending, Preparing, Ready or Collected.");
+    
     const transitions = { Pending: ["Preparing"], Preparing: ["Ready"], Ready: ["Collected"], Collected: [] };
-    if (nextStatus !== order.status && !transitions[order.status].includes(nextStatus)) throw httpError(400, `Invalid status change from ${order.status} to ${nextStatus}.`);
-    const number = orderNumberFromId(order.id);
-    await db.execute("UPDATE orders SET status = ? WHERE order_number = ?", [nextStatus, number]);
-    res.json(await getOrder(order.id));
+    if (nextStatus !== order.status && !transitions[order.status].includes(nextStatus)) {
+      throw httpError(400, `Invalid status change from ${order.status} to ${nextStatus}.`);
+    }
+
+    order.status = nextStatus;
+    order.updatedAt = new Date().toISOString();
+
+    await redisClient.set(`order:${order.id}`, JSON.stringify(order));
+    res.json(order);
   } catch (error) { next(error); }
 });
+
 app.get("/api/staff/summary", requireStaff, async (req, res, next) => {
   try {
     const orders = await getAllOrders();
     const today = new Date().toISOString().slice(0, 10);
     const todaysOrders = orders.filter((order) => order.createdAt.slice(0, 10) === today);
+    
     const statusCounts = { Pending: 0, Preparing: 0, Ready: 0, Collected: 0 };
     let orderValue = 0;
     let collectedValue = 0;
+    
     for (const order of todaysOrders) {
       statusCounts[order.status] = (statusCounts[order.status] || 0) + 1;
       orderValue += order.total;
       if (order.status === "Collected") collectedValue += order.total;
     }
-    res.json({ date: today, orderCount: todaysOrders.length, orderValue: Math.round(orderValue * 100) / 100, collectedValue: Math.round(collectedValue * 100) / 100, statusCounts });
+    
+    res.json({
+      date: today,
+      orderCount: todaysOrders.length,
+      orderValue: Math.round(orderValue * 100) / 100,
+      collectedValue: Math.round(collectedValue * 100) / 100,
+      statusCounts
+    });
   } catch (error) { next(error); }
 });
+
 app.use((req, res) => res.status(404).json({ error: "Endpoint not found." }));
+
 app.use((error, req, res, next) => {
   console.error(error);
   const status = Number.isInteger(error.status) ? error.status : 500;
   res.status(status).json({ error: status === 500 ? "Something went wrong on the server. Please try again." : error.message });
 });
+
 async function start() {
   try {
-    await db.query("SELECT 1");
+    await redisClient.connect();
     await initialiseDatabase();
-    app.listen(PORT, () => console.log(`Aroma Coffee API running on port ${PORT} with MySQL`));
+    app.listen(PORT, () => console.log(`Aroma Coffee API running on port ${PORT} with Redis NoSQL`));
   } catch (error) {
-    console.error("Could not start backend. Check MySQL connection settings:", error.message);
+    console.error("Could not start backend. Check Redis connection settings:", error.message);
     process.exit(1);
   }
 }
+
 start();
