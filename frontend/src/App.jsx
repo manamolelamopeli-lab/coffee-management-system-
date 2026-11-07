@@ -43,7 +43,6 @@ function MenuPage({ menu, addToCart, loading, error, retry }) {
       <section id="menu-list" className="menu-section">
         <div className="section-heading">
           <div><span className="eyebrow">MADE FOR YOUR MOMENT</span><h2>Our <em>menu</em></h2></div>
-          <p>Prices in Lesotho Maloti (M)</p>
         </div>
         <div className="category-tabs">
           {categories.map((name) => <button key={name} className={category === name ? "selected" : ""} onClick={() => setCategory(name)}>{name}</button>)}
@@ -98,7 +97,7 @@ function CartPage({ cart, setCart, placeOrder, busy }) {
             <div className="total-row"><span>Total</span><strong>{money(total)}</strong></div>
           </div>
           <form className="checkout-form" onSubmit={submit}>
-            <h2>Checkout</h2><label>Your name<input value={customerName} onChange={(e) => setCustomerName(e.target.value)} maxLength="80" placeholder="e.g. Thabo" required /></label>
+            <h2>Checkout</h2><label>Your name<input value={customerName} onChange={(e) => setCustomerName(e.target.value)} maxLength="80" placeholder="  " required /></label>
             <p className="small-note">Your order number will be generated after the order is saved.</p>
             {error && <p className="form-error">{error}</p>}
             <button className="button button-gold full-width" disabled={busy}>{busy ? "Placing order…" : `Place order · ${money(total)}`}</button>
@@ -278,6 +277,6 @@ export default function App() {
       {page === "confirmation" && <Confirmation order={confirmation} onBack={() => setPage("menu")} />}
       {page === "staff" && <StaffPage token={token} setToken={setToken} menu={menu} reloadMenu={reloadMenu} orders={orders} reloadOrders={reloadOrders} summary={summary} reloadSummary={reloadSummary} />}
     </main>
-    <footer><div className="footer-brand">Aroma <em>Coffee</em></div><p>Fresh brews, sweet treats, better days.</p><small>Menu prices shown in Lesotho Maloti (M).</small></footer>
+    <footer><div className="footer-brand">Aroma <em>Coffee</em></div><p>Fresh brews, sweet treats, better days.</p></footer>
   </div>;
 }
